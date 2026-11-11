@@ -40,56 +40,65 @@ Open `config.py` and verify:
 
 ### Step 2 – (Optional) Train CHAL teacher first
 
-Follow the CHAL `README.md` to train on NUDT-MIRSDT, then copy the best checkpoint:
+`CHAL/model_data/pretrain.pth` is only the COCO YOLOX-S initialisation used to
+*start* CHAL training – it is **not** a teacher (teacher.py rejects it).
+Train CHAL on NUDT-MIRSDT following its README (note: the public CHAL repo
+imports `nets/module/CBAM.py`, which it does not ship), then:
 
 ```bash
-# in CHAL/
-cp logs/<run>/best_model.pth logs/best_model.pth
+cp CHAL/logs/<run>/best_epoch_weights.pth CHAL/logs/best_model.pth
 ```
 
 ### Step 3 – Train the student
 
-**GT-only mode** (no teacher needed – good for initial experiments):
+**GT-only mode** (no teacher needed):
 ```bash
 cd student
 python train_student.py
 ```
 
-**Distillation mode** (requires CHAL checkpoint):
+**Distillation mode** (requires a trained CHAL checkpoint):
 ```bash
 python train_student.py --teacher
 ```
 
+Training uses random 256×256 crops at native resolution; 10 % of the training
+sequences are held out for validation (model selection + threshold tuning).
+The test set is never used during training.
+
 ### Step 4 – Evaluate
 
 ```bash
-python evaluate.py --ckpt logs/best.pth
+python evaluate.py --ckpt logs/best.pth --profile
 ```
 
-Outputs:
-| Metric     | Meaning                          |
-|------------|----------------------------------|
-| **Pd**     | Detection probability (recall)   |
-| **Fa**     | False-alarm rate (FP/total px)   |
-| **Precision** | TP / (TP + FP)              |
-| **F1**     | Harmonic mean of Pd & Precision  |
+Metrics follow the official NUDT-MIRSDT protocol (DTUM `ShootingRules.py`):
+
+| Metric     | Meaning |
+|------------|---------|
+| **Pd**     | target-level detection probability (pred pixel within 1 px of target) |
+| **Fa**     | false-alarm pixels (> 4 px from every target) / total pixels |
+| **Precision** | object-level: detected targets / (detected + false-alarm components) |
+| **F1**     | harmonic mean of Pd and Precision |
+| pix_*      | pixel-level metrics (what the previous version reported) |
+
+The threshold tuned on validation is stored in `best.pth`. `--sweep` prints all
+thresholds for PR/ROC curves – do not pick the threshold on the test set.
 
 ---
 
 ## Model design
 
 ```
-CompactStudent
-  ├── Stem (DW-Sep, 1→16 ch)
-  ├── TemporalBlock × 2
-  │     ├── Spatial DW-Sep (per frame)
-  │     └── CausalTempConv (past→present, no future leakage)
-  ├── Spatial Encoder (3-scale DW-Sep, max-pool)
-  ├── Decoder (skip connections, bilinear upsample)
-  └── Head (1×1 conv → sigmoid)
+CompactStudent  (~0.53 M params, ~16 GMACs at 5×512×512)
+  ├── Anomaly priors (parameter-free, causal):
+  │     current frame, current − mean(past frames), current − previous,
+  │     current − local mean
+  ├── Shared per-frame stem → frames stacked on channels → 3×3 conv
+  │     (pixel-wise spatio-temporal fusion)
+  ├── 4-level residual U-Net encoder/decoder with full-resolution skips
+  └── 1×1 head → logits
 ```
-
-**Parameters: ~16 k** (vs CHAL's SlowFast + background field: ~tens of millions)
 
 ---
 
@@ -97,8 +106,8 @@ CompactStudent
 
 | Loss | Weight | Description |
 |------|--------|-------------|
-| `L_gt`   | 1.0 | Weighted BCE vs GT mask (pos_weight=10 for class imbalance) |
-| `L_pred` | 1.0 | MSE between student and CHAL teacher heatmaps |
+| `L_gt`   | 1.0 | BCE-with-logits + SoftIoU vs GT mask |
+| `L_pred` | 1.0 | MSE between CHAL's stride-8 confidence map and the student heatmap max-pooled to that grid |
 | `L_resp` | 0.5 | MSE between student(x) and student(x_aug) – response invariance |
 
 Weights are in `config.py`.
@@ -107,7 +116,8 @@ Weights are in `config.py`.
 
 ## Augmentation (label-preserving)
 
-Applied only to background intensity — target pixel locations are unchanged:
-1. Random brightness shift (±30%)
-2. Random contrast scale (±30%)
-3. Additive Gaussian noise (σ=0.05)
+Identical for every frame of a clip (motion cues preserved), kept mild so
+low-SNR targets survive; no clamping:
+1. Random brightness shift (±0.1)
+2. Random contrast scale (±20%)
+3. Additive Gaussian noise (σ=0.01)

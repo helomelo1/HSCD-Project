@@ -1,18 +1,28 @@
 """
 Compact Student Model – CausalMARD (Motion-Anomaly Response Distillation).
 
-Design goals:
-  • Much fewer parameters than CHAL (SlowFast + neural background field)
-  • Explicit temporal modelling with causal (past→present) convolutions
-  • Outputs a per-pixel anomaly heatmap in [0, 1]
+Input : clip (B, T, 1, H, W) in [0, 1]; frame T-1 is the current (key) frame.
+Output: LOGITS (B, 1, H, W). Apply torch.sigmoid() to get the heatmap.
 
-Architecture (encoder-decoder with temporal causal convs):
-  Stem  → T×DepthwiseTempConv blocks (causal, no future leakage)
-        → Spatial encoder (3 scales, depthwise-separable)
-        → Lightweight decoder with skip connections
-        → 1×1 conv → sigmoid heatmap
+Why this design (vs. the previous version):
+  The previous temporal block mixed frames only through *globally pooled*
+  channel statistics, so a 2-3 px moving target had no path from the past
+  frames to the output (the model was effectively single-frame). Here time is
+  fused PER PIXEL, and parameter-free background/motion anomaly priors are
+  provided explicitly (the lightweight analogue of CHAL's background-centred
+  anomaly modelling):
+
+  1. Anomaly priors (no parameters, causal: only frames <= t are used)
+       cur, cur - mean(past frames)  [temporal background residual],
+       cur - previous frame          [motion],
+       cur - local mean              [spatial local contrast]
+  2. Shared per-frame stem -> frames stacked on channels -> 3x3 conv
+     (pixel-wise spatio-temporal fusion; no Conv3d, so it runs on MPS/CPU/CUDA)
+  3. 4-level residual U-Net with full-resolution skips (small targets need them)
+  4. 1x1 head -> logits (bias initialised to a 1 % prior for stable training)
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,108 +30,41 @@ import torch.nn.functional as F
 
 # ── Building blocks ───────────────────────────────────────────────────────────
 
-class DepthwiseSep(nn.Module):
-    """Depthwise-separable 2-D convolution."""
-    def __init__(self, in_ch, out_ch, k=3, stride=1):
+def conv_bn_relu(in_ch, out_ch, k=3):
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, k, padding=k // 2, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True))
+
+
+class ResBlock(nn.Module):
+    """3x3 conv - BN - ReLU - 3x3 conv - BN, plus (projected) identity."""
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.dw = nn.Conv2d(in_ch, in_ch, k, stride=stride,
-                            padding=k // 2, groups=in_ch, bias=False)
-        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-        self.bn = nn.BatchNorm2d(out_ch)
+        self.body = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch))
+        self.skip = (nn.Identity() if in_ch == out_ch else
+                     nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, bias=False),
+                                   nn.BatchNorm2d(out_ch)))
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        return self.act(self.bn(self.pw(self.dw(x))))
+        return self.act(self.body(x) + self.skip(x))
 
 
-class CausalTempConv(nn.Module):
-    """
-    1-D causal convolution along the temporal axis (kernel_size=3).
-    Applies *per-channel* (groups=C) so it is very cheap.
-    Padding = 2 on the left (past), 0 on the right (no future).
-    """
-    def __init__(self, channels: int, kernel_size: int = 3):
-        super().__init__()
-        self.pad = kernel_size - 1
-        self.conv = nn.Conv1d(channels, channels, kernel_size,
-                              groups=channels, bias=False)
-        self.bn  = nn.BatchNorm1d(channels)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        # x: (B, C, T)
-        x = F.pad(x, (self.pad, 0))
-        return self.act(self.bn(self.conv(x)))
-
-
-class TemporalBlock(nn.Module):
-    """Spatial DW-Sep conv + causal temporal mixing."""
-    def __init__(self, ch):
-        super().__init__()
-        self.spatial = DepthwiseSep(ch, ch)
-        self.temporal = CausalTempConv(ch)
-
-    def forward(self, frames):
-        """
-        frames: list of T tensors each (B, C, H, W)
-        returns: list of T tensors (B, C, H, W)
-        """
-        T = len(frames)
-        B, C, H, W = frames[0].shape
-        # spatial
-        sp = [self.spatial(f) for f in frames]       # list of (B,C,H,W)
-        # temporal along spatial average (global avg pool → 1d conv → scale)
-        pooled = torch.stack([f.mean(dim=[2, 3]) for f in sp], dim=2)  # (B,C,T)
-        mixed  = self.temporal(pooled)                                   # (B,C,T)
-        # multiply back as a channel-wise scale (SE-style)
-        out = []
-        for t in range(T):
-            gate = torch.sigmoid(mixed[:, :, t]).unsqueeze(-1).unsqueeze(-1)
-            out.append(sp[t] * gate)
-        return out
-
-
-# ── Spatial Encoder ───────────────────────────────────────────────────────────
-
-class Encoder(nn.Module):
-    def __init__(self, in_ch, base_ch):
-        super().__init__()
-        # 3 downsampling stages, each halves spatial resolution
-        self.s1 = nn.Sequential(
-            DepthwiseSep(in_ch,       base_ch,   k=3),
-            DepthwiseSep(base_ch,     base_ch,   k=3))
-        self.s2 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DepthwiseSep(base_ch,     base_ch*2, k=3),
-            DepthwiseSep(base_ch*2,   base_ch*2, k=3))
-        self.s3 = nn.Sequential(
-            nn.MaxPool2d(2),
-            DepthwiseSep(base_ch*2,   base_ch*4, k=3),
-            DepthwiseSep(base_ch*4,   base_ch*4, k=3))
-
-    def forward(self, x):
-        s1 = self.s1(x)
-        s2 = self.s2(s1)
-        s3 = self.s3(s2)
-        return s1, s2, s3   # skips + deepest
-
-
-class Decoder(nn.Module):
-    def __init__(self, base_ch):
-        super().__init__()
-        self.up2 = DepthwiseSep(base_ch*4 + base_ch*2, base_ch*2)
-        self.up1 = DepthwiseSep(base_ch*2 + base_ch,   base_ch)
-
-    def forward(self, s1, s2, s3):
-        # upsample s3 to s2 resolution, concat, refine
-        x = torch.cat([F.interpolate(s3, size=s2.shape[-2:],
-                        mode='bilinear', align_corners=False), s2], dim=1)
-        x = self.up2(x)   # (B, base*2, H/2, W/2)
-        # upsample to s1 resolution, concat, refine
-        x = torch.cat([F.interpolate(x, size=s1.shape[-2:],
-                        mode='bilinear', align_corners=False), s1], dim=1)
-        x = self.up1(x)   # (B, base, H, W)
-        return x
+def anomaly_priors(clip: torch.Tensor) -> torch.Tensor:
+    """clip (B,T,1,H,W) -> (B,4,H,W) parameter-free causal anomaly cues."""
+    cur  = clip[:, -1]                                   # (B,1,H,W)
+    past = clip[:, :-1]
+    bg   = past.mean(dim=1) if past.shape[1] > 0 else cur
+    prev = clip[:, -2] if clip.shape[1] > 1 else cur
+    local_mean = F.avg_pool2d(cur, 9, stride=1, padding=4,
+                              count_include_pad=False)
+    return torch.cat([cur, cur - bg, cur - prev, cur - local_mean], dim=1)
 
 
 # ── Full Student ──────────────────────────────────────────────────────────────
@@ -129,37 +72,59 @@ class Decoder(nn.Module):
 class CompactStudent(nn.Module):
     """
     Input : clip  (B, T, 1, H, W)
-    Output: heatmap (B, 1, H, W) in [0, 1]
+    Output: logits (B, 1, H, W)   (H, W must be divisible by 8)
     """
     def __init__(self, num_frames=5, in_channels=1, base_ch=16):
         super().__init__()
         self.T = num_frames
-        # Per-frame stem
-        self.stem = DepthwiseSep(in_channels, base_ch, k=3)
-        # Temporal blocks
-        self.t_block1 = TemporalBlock(base_ch)
-        self.t_block2 = TemporalBlock(base_ch)
-        # Encode the last (most-recent, causal) frame representation
-        self.encoder = Encoder(base_ch, base_ch)
-        self.decoder = Decoder(base_ch)
-        self.head    = nn.Sequential(
-            nn.Conv2d(base_ch, 1, 1),
-            nn.Sigmoid())
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+
+        # per-frame shared stem, then pixel-wise temporal fusion
+        self.frame_stem = conv_bn_relu(in_channels, c1)
+        self.temporal_fuse = conv_bn_relu(c1 * num_frames, c1)
+        # explicit anomaly-prior branch
+        self.prior_stem = conv_bn_relu(4, c1)
+
+        # encoder
+        self.enc1 = ResBlock(2 * c1, c1)                 # H
+        self.enc2 = ResBlock(c1, c2)                     # H/2
+        self.enc3 = ResBlock(c2, c3)                     # H/4
+        self.enc4 = ResBlock(c3, c4)                     # H/8 (bottleneck)
+        self.pool = nn.MaxPool2d(2)
+
+        # decoder
+        self.dec3 = ResBlock(c4 + c3, c3)
+        self.dec2 = ResBlock(c3 + c2, c2)
+        self.dec1 = ResBlock(c2 + c1, c1)
+
+        self.head = nn.Conv2d(c1, 1, 1)
+        nn.init.constant_(self.head.bias, -math.log((1 - 0.01) / 0.01))
+
+    @staticmethod
+    def _up(x, ref):
+        return F.interpolate(x, size=ref.shape[-2:], mode='bilinear',
+                             align_corners=False)
 
     def forward(self, clip):
-        """clip: (B, T, 1, H, W)"""
         B, T, C, H, W = clip.shape
-        # Stem on each frame
-        frames = [self.stem(clip[:, t]) for t in range(T)]   # T×(B,C,H,W)
-        # Temporal blocks (causal)
-        frames = self.t_block1(frames)
-        frames = self.t_block2(frames)
-        # Use only the last frame (most-recent, full temporal context)
-        feat = frames[-1]                                      # (B, C, H, W)
-        s1, s2, s3 = self.encoder(feat)
-        out        = self.decoder(s1, s2, s3)                 # (B, base, H, W)
-        heatmap    = self.head(out)                           # (B, 1, H, W)
-        return heatmap
+        if T != self.T:
+            raise ValueError(f"model built for {self.T} frames, got {T}")
+
+        # pixel-wise spatio-temporal fusion (all frames are <= t: causal)
+        f = self.frame_stem(clip.reshape(B * T, C, H, W))        # (B*T,c1,H,W)
+        f = f.reshape(B, T * f.shape[1], H, W)                   # (B,T*c1,H,W)
+        f = self.temporal_fuse(f)                                # (B,c1,H,W)
+        p = self.prior_stem(anomaly_priors(clip))                # (B,c1,H,W)
+
+        e1 = self.enc1(torch.cat([f, p], dim=1))
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        d3 = self.dec3(torch.cat([self._up(e4, e3), e3], dim=1))
+        d2 = self.dec2(torch.cat([self._up(d3, e2), e2], dim=1))
+        d1 = self.dec1(torch.cat([self._up(d2, e1), e1], dim=1))
+        return self.head(d1)                                     # logits
 
 
 # ── Parameter count utility ───────────────────────────────────────────────────
@@ -170,7 +135,7 @@ def count_params(model: nn.Module) -> int:
 
 if __name__ == "__main__":
     m = CompactStudent(num_frames=5, base_ch=16)
-    x = torch.randn(2, 5, 1, 256, 256)
+    x = torch.rand(2, 5, 1, 256, 256)
     y = m(x)
-    print(f"Output shape : {y.shape}")
+    print(f"Output shape : {y.shape} (logits)")
     print(f"Parameters   : {count_params(m):,}")
