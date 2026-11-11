@@ -31,7 +31,7 @@ BASE_CH      = 16         # student base channels (widths 16/32/64/128)
 
 # ── Training ──────────────────────────────────────────────────────────────────
 BATCH_SIZE   = 8
-NUM_EPOCHS   = 100
+NUM_EPOCHS   = 50
 LR           = 1e-3
 WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 2
