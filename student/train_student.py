@@ -22,6 +22,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from typing import Optional
 
 # ── add project root to path so imports work from anywhere ───────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -85,7 +86,7 @@ def train(args):
                             weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=NUM_EPOCHS, eta_min=LR * 0.01)
-    criterion = DistillationLoss(pos_weight=10.0)
+    criterion = DistillationLoss(pos_weight=100.0)
 
     best_f1   = 0.0
     log_path  = os.path.join(LOG_DIR, "train_log.csv")

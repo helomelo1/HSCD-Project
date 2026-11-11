@@ -20,7 +20,7 @@ from config import LAMBDA_GT, LAMBDA_PRED, LAMBDA_RESP
 
 # weighted BCE to handle extreme class imbalance (target pixels << background)
 class WeightedBCE(nn.Module):
-    def __init__(self, pos_weight: float = 10.0):
+    def __init__(self, pos_weight: float = 100.0):
         super().__init__()
         self.pw = pos_weight
 
@@ -30,10 +30,25 @@ class WeightedBCE(nn.Module):
             pred, target, pos_weight=pw)
 
 
+class DiceLoss(nn.Module):
+    def __init__(self, smooth: float = 1.0):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred   = pred.view(pred.shape[0], -1)
+        target = target.view(target.shape[0], -1)
+        inter  = (pred * target).sum(dim=1)
+        dice   = (2. * inter + self.smooth) / \
+                 (pred.sum(dim=1) + target.sum(dim=1) + self.smooth)
+        return 1. - dice.mean()
+
+
 class DistillationLoss(nn.Module):
-    def __init__(self, pos_weight: float = 10.0):
+    def __init__(self, pos_weight: float = 100.0):
         super().__init__()
         self.bce  = WeightedBCE(pos_weight)
+        self.dice = DiceLoss()
 
     def forward(self,
                 student_logit: torch.Tensor,   # (B,1,H,W) pre-sigmoid
@@ -44,7 +59,10 @@ class DistillationLoss(nn.Module):
                 ) -> dict:
 
         # GT supervision
-        l_gt = self.bce(student_logit, mask)
+                # GT supervision: BCE + Dice
+        l_bce  = self.bce(student_logit, mask)
+        l_dice = self.dice(student_heatmap, mask)
+        l_gt   = l_bce + l_dice
 
         # Prediction matching (teacher soft labels)
         if teacher_heatmap is not None:

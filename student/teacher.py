@@ -14,6 +14,7 @@ Usage:
 import sys, os
 import torch
 import torch.nn.functional as F
+from typing import Optional
 
 from config import CHAL_DIR, TEACHER_CKPT, NUM_FRAMES
 
@@ -32,7 +33,7 @@ class CHALTeacher:
     """
     def __init__(self, ckpt_path: str = TEACHER_CKPT,
                  num_classes: int = 1,
-                 device: str | None = None):
+                 device: Optional[str] = None):
         if CHAL_DIR not in sys.path:
             sys.path.insert(0, CHAL_DIR)
 

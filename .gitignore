@@ -2,3 +2,4 @@ NUDT-MIRSDT
 *.zip
 venv
 *.pdf
+*.pyc
